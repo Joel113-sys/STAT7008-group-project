@@ -53,7 +53,11 @@ class WebAgent:
         
         # Loop detection
         self.last_actions = []
-        self.action_limit = 3  # Maximum times same action can repeat
+        self.action_limit = 3
+        
+        # 🆕 NEW: Task step tracking
+        self.task_steps = []  # List of step descriptions
+        self.current_step_index = 0  # Which step are we on?
         
         print("Model loaded successfully!")
     
@@ -197,55 +201,183 @@ class WebAgent:
                 return True
         
         return False
+        
+    def get_interactive_elements(self, page: Page) -> dict:
+        """Extract all clickable elements with their text and selectors"""
+        try:
+            elements = {
+                "links": [],
+                "buttons": [],
+                "inputs": []
+            }
+            
+            # Extract links
+            links = page.locator("a[href]").all()
+            seen_texts = set()  # 🆕 去重
+            
+            for i, link in enumerate(links):
+                try:
+                    text = link.inner_text().strip()
+                    href = link.get_attribute("href")
+                    
+                    # 🆕 过滤条件改进
+                    if (text and 
+                        len(text) > 0 and 
+                        len(text) < 100 and 
+                        text not in seen_texts and  # 去重
+                        href):  # 必须有 href
+                        
+                        elements["links"].append({
+                            "index": len(elements["links"]),  # 🆕 使用实际索引
+                            "text": text,
+                            "href": href
+                        })
+                        seen_texts.add(text)
+                        
+                        # 🆕 限制数量，避免太多
+                        if len(elements["links"]) >= 30:
+                            break
+                except:
+                    continue
+            
+            # Extract buttons
+            buttons = page.locator("button").all()
+            for i, button in enumerate(buttons[:10]):
+                try:
+                    text = button.inner_text().strip()
+                    if text:
+                        elements["buttons"].append({
+                            "index": i,
+                            "text": text
+                        })
+                except:
+                    continue
+            
+            return elements
+        except Exception as e:
+            print(f"Error extracting elements: {e}")
+            return {"links": [], "buttons": [], "inputs": []}
+
+    def format_elements_for_prompt(self, elements: dict) -> str:
+        """Format extracted elements for the prompt"""
+        output = "\nClickable elements on this page:\n"
+        
+        if elements["links"]:
+            output += "\nLinks:\n"
+            for link in elements["links"][:15]:  # Show first 15
+                output += f"  [{link['index']}] {link['text']}\n"
+        
+        if elements["buttons"]:
+            output += "\nButtons:\n"
+            for btn in elements["buttons"][:10]:
+                output += f"  [{btn['index']}] {btn['text']}\n"
+        
+        if not elements["links"] and not elements["buttons"]:
+            output += "  (No clickable elements found)\n"
+        
+        return output
+
+    def parse_task_steps(self, user_goal: str):
+        """🆕 Extract numbered steps from task description"""
+        step_pattern = r'Step\s+\d+:\s*(.+?)(?=Step\s+\d+:|$)'
+        matches = re.findall(step_pattern, user_goal, re.DOTALL | re.IGNORECASE)
+        
+        self.task_steps = [step.strip() for step in matches]
+        self.current_step_index = 0
+        
+        if self.task_steps:
+            print(f"\n📋 Parsed {len(self.task_steps)} task steps:")
+            for i, step in enumerate(self.task_steps):
+                print(f"   {i+1}. {step}")
+            print()
+        
+        return self.task_steps
+
+    def get_current_step_instruction(self) -> str:
+        """🆕 Get the current step instruction"""
+        if not self.task_steps:
+            return ""
+        
+        if self.current_step_index < len(self.task_steps):
+            return self.task_steps[self.current_step_index]
+        
+        return "All steps completed"
     
-    def analyze_page(self, screenshot_path: str, dom_summary: str, user_goal: str, current_url: str) -> dict:
-        """Analyze page using VLLM and decide next action - improved with context"""
+    def advance_to_next_step(self):
+        """🆕 Move to next step after successful action"""
+        if self.current_step_index < len(self.task_steps):
+            self.current_step_index += 1
+            print(f"\n✅ Completed step {self.current_step_index}/{len(self.task_steps)}")
+            if self.current_step_index < len(self.task_steps):
+                print(f"📌 Next step: {self.task_steps[self.current_step_index]}\n")
+
+    def analyze_page(self, screenshot_path: str, dom_summary: str, user_goal: str, current_url: str, elements: dict) -> dict:
+        """Analyze page - improved with step-by-step guidance"""
         print("\nAnalyzing page with VLLM...")
         
-        # Improved prompt with current state awareness
-        prompt = f"""You are a web browsing assistant.
+        # Format elements for prompt
+        elements_text = self.format_elements_for_prompt(elements)
+        
+        # 🆕 Get current step instruction
+        current_step = self.get_current_step_instruction()
+        step_info = ""
+        if current_step:
+            step_info = f"""
+            CURRENT STEP ({self.current_step_index + 1}/{len(self.task_steps)}):
+            {current_step}
 
-User Goal: {user_goal}
+            YOU MUST COMPLETE THIS STEP BEFORE MOVING TO THE NEXT ONE.
+            """
+                    
+            prompt = f"""You are a web browsing assistant following a step-by-step task.
 
-Current Page Info:
-{dom_summary}
+            User Goal: {user_goal}
 
-Current URL: {current_url}
+            {step_info}
 
-IMPORTANT CONTEXT:
-- You are already on the page: {current_url}
-- If the current page already shows the information needed, use DONE action
-- Do NOT navigate to the same URL you're already on
-- If you see version information in the page info above, the task may already be complete
-- Look carefully at the screenshot for version numbers
+            Current Page Info:
+            {dom_summary}
 
-Based on the screenshot and page information, decide the next action.
+            Current URL: {current_url}
 
-Available actions:
-1. GOTO - Navigate to a DIFFERENT URL (only if you need to go somewhere else)
-2. CLICK - Click an element on the current page
-3. SCROLL - Scroll down to see more content
-4. DONE - Task complete (use this if you found the information)
+            {elements_text}
 
-CRITICAL: Use ONLY standard ASCII punctuation in your JSON response:
-- Use double quotes: " (NOT " or ")
-- Use commas: , (NOT ，)
-- Use colons: : (NOT ：)
-- Use periods: . (NOT 。)
+            ⚠️ CRITICAL INSTRUCTIONS:
+            1. Focus ONLY on the current step: "{current_step}"
+            2. Find the EXACT element that matches the text in the current step
+            3. The element text must EXACTLY match what's in the step (e.g., if step says "Community", find "Community" link)
+            4. Ignore all other elements, even if they look important
+            5. Use the element's INDEX number from the list above
 
-Respond with ONLY valid JSON in this exact format:
-{{
-    "thought": "explain your reasoning",
-    "action": "ACTION_NAME",
-    "parameter": "parameter value",
-    "completed": false
-}}
+            For CLICK actions:
+            - Find the EXACT text match in the elements list
+            - Use the corresponding INDEX number
+            - Example: Step says "Click Community" → Find "Community" in list → Use its index
 
-Examples:
-{{"thought": "Need to visit Downloads page", "action": "CLICK", "parameter": "Downloads", "completed": false}}
-{{"thought": "Found Python 3.14.0 on current page", "action": "DONE", "parameter": "", "completed": true}}
+            Available actions:
+            1. GOTO - Navigate to a URL
+            2. CLICK - Click an element (use index number of EXACT text match)
+            3. SCROLL - Scroll down
+            4. DONE - Current step complete (ONLY after clicking the correct element)
 
-Your JSON response:"""
+            Set "completed": true ONLY when you have clicked the EXACT element from the current step.
+
+            Respond with ONLY valid JSON:
+            {{
+                "thought": "Found '{current_step}' at index X, clicking it",
+                "action": "CLICK",
+                "parameter": "X",
+                "completed": false
+            }}
+
+            Examples:
+            - Step: "Click on Community link"
+            → {{"thought": "Current step requires 'Community', found at index 7", "action": "CLICK", "parameter": "7", "completed": false}}
+            
+            - Step: "Click on Python FAQs link"
+            → {{"thought": "Current step requires 'Python FAQs', found at index 15", "action": "CLICK", "parameter": "15", "completed": false}}
+
+            Your JSON response:"""
         
         # Load and encode image
         image = Image.open(screenshot_path)
@@ -448,7 +580,7 @@ Your JSON response:"""
             "completed": True
         }
     
-    def execute_action(self, page, action_plan: dict) -> bool:
+    def execute_action(self, page, action_plan: dict, elements: dict = None) -> bool:
         """Execute the planned action"""
         action = action_plan.get("action", "").upper().strip()
         parameter = action_plan.get("parameter", "").strip()
@@ -492,49 +624,94 @@ Your JSON response:"""
                     print(f"❌ Navigation error: {e}")
                     return False
                 
-            elif action == "CLICK":
+            if action == "CLICK":
                 if not parameter:
-                    print("❌ Error: CLICK requires an element parameter")
+                    print("❌ Error: CLICK requires a parameter")
                     return False
                 
-                print(f"🔍 Looking for element: {parameter}")
-                
-                # Try multiple selector strategies
-                selectors = [
-                    f"text={parameter}",
-                    f"a:has-text('{parameter}')",
-                    f"button:has-text('{parameter}')",
-                    f"//*[contains(text(), '{parameter}')]",
-                    f"[aria-label*='{parameter}' i]",
-                    f"a:has-text('{parameter.lower()}')",
-                ]
-                
                 clicked = False
-                for selector in selectors:
-                    try:
-                        element = page.locator(selector).first
-                        count = element.count()
-                        if count > 0:
-                            print(f"  Found with selector: {selector}")
-                            element.scroll_into_view_if_needed()
-                            time.sleep(0.5)
-                            element.click(timeout=5000)
+                
+                # Strategy 1: Try clicking by index
+                if parameter.isdigit() and elements:
+                    index = int(parameter)
+                    
+                    # Try links first
+                    if index < len(elements.get("links", [])):
+                        try:
+                            link = elements["links"][index]
+                            print(f"🔍 Clicking link [{index}]: {link['text']}")
                             
+                            # Use href to find element
+                            selector = f"a[href='{link['href']}']"
+                            element = page.locator(selector).first
+                            
+                            if element.count() > 0:
+                                element.scroll_into_view_if_needed()
+                                time.sleep(0.5)
+                                element.click(timeout=5000)
+                                clicked = True
+                                print(f"✓ Clicked link: {link['text']}")
+                        except Exception as e:
+                            print(f"⚠ Failed to click by index: {e}")
+                
+                # Strategy 2: Try clicking by text (fallback)
+                if not clicked:
+                    print(f"🔍 Looking for element with text: {parameter}")
+                    
+                    # 🆕 先打印页面上所有匹配的元素
+                    try:
+                        all_matches = page.locator(f"text={parameter}").all()
+                        print(f"   Found {len(all_matches)} elements containing '{parameter}'")
+                        
+                        for i, match in enumerate(all_matches[:5]):
                             try:
-                                page.wait_for_load_state("networkidle", timeout=5000)
+                                text = match.inner_text()[:50]
+                                print(f"   Match {i}: {text}")
                             except:
                                 pass
-                            
-                            time.sleep(2)
-                            clicked = True
-                            print(f"✓ Successfully clicked: {parameter}")
-                            break
                     except Exception as e:
-                        continue
+                        print(f"   Could not list matches: {e}")
+                    
+                    selectors = [
+                        f"a:has-text('{parameter}'):visible",
+                        f"button:has-text('{parameter}'):visible",
+                        f"text={parameter}",
+                        f"a:text-is('{parameter}')",
+                        f"//*[normalize-space(text())='{parameter}']",
+                    ]
+                    
+                    for selector in selectors:
+                        try:
+                            print(f"   Trying selector: {selector}")  # 🆕 调试输出
+                            element = page.locator(selector).first
+                            if element.count() > 0:
+                                print(f"  ✓ Found with selector: {selector}")
+                                element.scroll_into_view_if_needed()
+                                time.sleep(0.5)
+                                element.click(timeout=5000, force=True)  # 🆕 添加 force=True
+                                clicked = True
+                                print(f"✓ Clicked: {parameter}")
+                                break
+                            else:
+                                print(f"   ✗ No match for: {selector}")  # 🆕 调试输出
+                        except Exception as e:
+                            print(f"   ✗ Error with {selector}: {e}")  # 🆕 改进错误信息
+                            continue
                 
                 if not clicked:
                     print(f"❌ Could not find clickable element: {parameter}")
+                    print("💡 Available elements (first 10):")
+                    if elements:
+                        for i, link in enumerate(elements.get("links", [])[:10]):  # 显示更多
+                            print(f"   [{i}] {link['text'][:60]}")  # 截断长文本
                     return False
+                
+                # Wait for page to load
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except:
+                    pass
+                time.sleep(2)
                 
                 return True
                 
@@ -572,11 +749,13 @@ Your JSON response:"""
             traceback.print_exc()
             return False
     
-    def run_task(self, user_goal: str, max_steps: int = 5):
+    def run_task(self, user_goal: str, max_steps: int = 10):
         """Run a complete task"""
         print(f"\n{'='*60}")
         print(f"🎯 Task: {user_goal}")
         print(f"{'='*60}\n")
+        
+        self.parse_task_steps(user_goal)
         
         with sync_playwright() as p:
             print("🚀 Launching browser...")
@@ -596,7 +775,6 @@ Your JSON response:"""
             
             page = context.new_page()
             
-            # Extract starting URL from goal
             url_pattern = r'https?://[^\s]+'
             urls = re.findall(url_pattern, user_goal)
             
@@ -614,24 +792,39 @@ Your JSON response:"""
                 page.goto("about:blank")
             
             step = 0
-            self.last_actions = []  # Reset action history
+            self.last_actions = []
             
             while step < max_steps:
+                # 🆕 检查是否所有步骤已完成
+                if self.current_step_index >= len(self.task_steps):
+                    print("\n🎉 All task steps completed!")
+                    break
+                
                 print(f"\n{'─'*60}")
                 print(f"📍 Step {step + 1}/{max_steps}")
+                print(f"📌 Current task step: [{self.current_step_index + 1}/{len(self.task_steps)}] {self.get_current_step_instruction()}")
                 print(f"{'─'*60}")
                 
                 screenshot_path = self.capture_screenshot(page, step)
                 dom_summary = self.get_dom_summary(page)
                 current_url = page.url
                 
-                print(f"📄 Current URL: {current_url}")
+                elements = self.get_interactive_elements(page)
                 
-                # Pass current URL to analyzer
-                action_plan = self.analyze_page(screenshot_path, dom_summary, user_goal, current_url)
+                print(f"📄 Current URL: {current_url}")
+                print(f"🔗 Found {len(elements['links'])} links, {len(elements['buttons'])} buttons")
+                
+                action_plan = self.analyze_page(
+                    screenshot_path, 
+                    dom_summary, 
+                    user_goal, 
+                    current_url,
+                    elements
+                )
                 
                 self.history.append({
                     "step": step,
+                    "task_step": f"{self.current_step_index + 1}/{len(self.task_steps)}: {self.get_current_step_instruction()}",
                     "screenshot": screenshot_path,
                     "dom_summary": dom_summary,
                     "thought": action_plan.get("thought", ""),
@@ -640,17 +833,29 @@ Your JSON response:"""
                     "url": current_url
                 })
                 
-                if action_plan.get("completed", False) or action_plan.get("action", "").upper() == "DONE":
-                    print("\n✅ Task completed!")
-                    break
+                # 🆕 修改：处理 DONE 动作
+                if action_plan.get("action", "").upper() == "DONE":
+                    print("\n✅ DONE action received")
+                    self.advance_to_next_step()
+                    step += 1
+                    continue
                 
-                should_continue = self.execute_action(page, action_plan)
-                if not should_continue:
-                    print("\n⏹ Stopping execution")
-                    break
+                # 🆕 修改：执行动作
+                action_success = self.execute_action(page, action_plan, elements)
+                
+                if not action_success:
+                    print("\n❌ Action execution failed")
+                    # 🆕 即使失败也尝试继续（可选：也可以break）
+                    step += 1
+                    continue
+                
+                # 🆕 关键修改：成功执行动作后，立即前进到下一步
+                print(f"\n✅ Action executed successfully")
+                self.advance_to_next_step()
                 
                 step += 1
             
+            # 最终截图
             print("\n📸 Taking final screenshot...")
             print(f"📄 Final URL: {page.url}")
             
@@ -696,5 +901,23 @@ def process_vision_info(messages):
 
 if __name__ == "__main__":
     agent = WebAgent()
-    task = "Go to https://www.python.org and find information about the latest Python version"
-    agent.run_task(task, max_steps=3)
+    task = """Go to https://www.python.org
+
+    Step 1: Click on "Community" link 
+    Step 2: Click on "Python FAQs" link
+
+    """
+    agent.run_task(task, max_steps=5)
+
+
+    # task = """Go to https://arxiv.org/
+
+    # Step 1: Click on "Astrophysics" link 
+    # Step 2: Click on "current month's" link
+    # Step 3: Click on the first listed link
+
+    # IMPORTANT: Ignore navigation menu items
+    # """
+# task = "Go to https://www.python.org and click through any Python version hyperlink, and then click another hyperlink in the poped out page."
+#  https://arxiv.org/
+# task = "Go to https://www.python.org and find information about the latest Python version"
